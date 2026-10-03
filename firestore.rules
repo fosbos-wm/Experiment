@@ -1,0 +1,98 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- Hilfsfunktionen ----------
+    function angemeldet() { return request.auth != null; }
+    function istLehrkraft() {
+      return angemeldet() && exists(/databases/$(database)/documents/lehrer/$(request.auth.uid));
+    }
+    function raumPfad(code) { return /databases/$(database)/documents/raeume/$(code); }
+    function teilnehmerPfad(code, u) { return /databases/$(database)/documents/raeume/$(code)/teilnehmer/$(u); }
+    function istRaumLehrkraft(code) {
+      return istLehrkraft() && get(raumPfad(code)).data.lehrerUid == request.auth.uid;
+    }
+    // Gleich große Gruppen: Die Gruppe darf nur gewählt werden, wenn sie nicht größer ist als die andere.
+    function gruppeErlaubt(code, g) {
+      let r = get(raumPfad(code)).data;
+      return r.anzA == r.anzB || (r.anzA < r.anzB && g == 'A') || (r.anzB < r.anzA && g == 'B');
+    }
+    // Beim Beitritt zählt genau ein Zähler um 1 hoch, passend zur Gruppe, und nur zusammen mit dem neuen Teilnehmer-Dokument.
+    function beitrittsZaehler(code) {
+      let alt = resource.data;
+      let neu = request.resource.data;
+      let tp = teilnehmerPfad(code, request.auth.uid);
+      return alt.offen == true
+        && neu.diff(alt).affectedKeys().hasOnly(['anzA', 'anzB'])
+        && !exists(tp) && existsAfter(tp)
+        && ((neu.anzA == alt.anzA + 1 && neu.anzB == alt.anzB && getAfter(tp).data.gruppe == 'A')
+         || (neu.anzB == alt.anzB + 1 && neu.anzA == alt.anzA && getAfter(tp).data.gruppe == 'B'));
+    }
+
+    // ---------- Lehrkräfte: Dokument-ID = UID der Lehrkraft (wird von Hand in der Konsole angelegt) ----------
+    match /lehrer/{u} {
+      allow read: if angemeldet() && request.auth.uid == u;
+      allow write: if false;
+    }
+
+    // ---------- Räume (Dokument-ID = Klassencode) ----------
+    match /raeume/{code} {
+      // Wer den Code kennt, kann den Raum lesen. Auflisten dürfen nur Lehrkräfte ihre eigenen Räume.
+      allow get: if angemeldet();
+      allow list: if istLehrkraft() && resource.data.lehrerUid == request.auth.uid;
+
+      allow create: if istLehrkraft()
+        && code.matches('[0-9]{6}')
+        && request.resource.data.keys().hasOnly(['titel', 'lehrerUid', 'offen', 'vergleichFrei', 'anzA', 'anzB', 'createdAt'])
+        && request.resource.data.lehrerUid == request.auth.uid
+        && request.resource.data.offen == true
+        && request.resource.data.vergleichFrei == false
+        && request.resource.data.anzA == 0 && request.resource.data.anzB == 0
+        && request.resource.data.titel is string && request.resource.data.titel.size() <= 60;
+
+      allow update: if (istLehrkraft() && resource.data.lehrerUid == request.auth.uid
+                        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['offen', 'vergleichFrei', 'titel']))
+                    || (angemeldet() && beitrittsZaehler(code));
+
+      allow delete: if istLehrkraft() && resource.data.lehrerUid == request.auth.uid;
+
+      // ---------- Teilnehmende (mit Spitzname): nur die Person selbst und die Lehrkraft des Raums ----------
+      match /teilnehmer/{u} {
+        allow get: if (angemeldet() && request.auth.uid == u) || istRaumLehrkraft(code);
+        allow list: if istRaumLehrkraft(code);
+
+        allow create: if angemeldet() && request.auth.uid == u
+          && get(raumPfad(code)).data.offen == true
+          && request.resource.data.keys().hasOnly(['name', 'gruppe', 'beigetretenAt'])
+          && request.resource.data.name is string
+          && request.resource.data.name.size() >= 1 && request.resource.data.name.size() <= 24
+          && request.resource.data.gruppe in ['A', 'B']
+          && gruppeErlaubt(code, request.resource.data.gruppe);
+
+        allow update: if angemeldet() && request.auth.uid == u
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['woerter', 'fertigAt'])
+          && request.resource.data.woerter is int
+          && request.resource.data.woerter >= 0 && request.resource.data.woerter <= 10;
+
+        allow delete: if istRaumLehrkraft(code);
+      }
+
+      // ---------- Anonyme Ergebnisse (nur Gruppe und Wörterzahl, ohne Namen) ----------
+      // Teilnehmende sehen sie erst, wenn die Lehrkraft den Vergleich freigegeben hat.
+      match /ergebnisse/{u} {
+        allow read: if istRaumLehrkraft(code)
+          || (angemeldet() && exists(teilnehmerPfad(code, request.auth.uid))
+              && get(raumPfad(code)).data.vergleichFrei == true);
+
+        allow create, update: if angemeldet() && request.auth.uid == u
+          && exists(teilnehmerPfad(code, u))
+          && request.resource.data.keys().hasOnly(['gruppe', 'woerter', 'at'])
+          && request.resource.data.gruppe == get(teilnehmerPfad(code, u)).data.gruppe
+          && request.resource.data.woerter is int
+          && request.resource.data.woerter >= 0 && request.resource.data.woerter <= 10;
+
+        allow delete: if istRaumLehrkraft(code);
+      }
+    }
+  }
+}
